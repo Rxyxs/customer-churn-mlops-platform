@@ -1,0 +1,20 @@
+# Fase 1 - Datos y modelado
+pandas
+numpy
+scikit-learn
+lightgbm
+xgboost
+mlflow
+joblib
+matplotlib
+
+# Fase 2 - API y UI
+fastapi
+uvicorn[standard]
+pydantic
+streamlit
+requests
+
+# Fase 3 - Tests de integracion
+pytest
+httpx
