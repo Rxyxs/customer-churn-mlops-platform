@@ -1,5 +1,7 @@
 # Customer Churn & Financial Retention Platform
 
+![Simulador de ROI en Streamlit](docs/streamlit_preview.png)
+
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)
 ![LightGBM](https://img.shields.io/badge/LightGBM-gradient_boosting-2E7D32)
 ![MLflow](https://img.shields.io/badge/MLflow-tracking_%26_registry-0194E2?logo=mlflow&logoColor=white)
@@ -76,7 +78,7 @@ Este proyecto se construyó en fases, entregadas y verificadas una por una — n
 
 `tests/`: suite de integración con `pytest`. `conftest.py` genera el dataset y entrena el modelo automáticamente si no existen — verifiqué esto de verdad borrando todos los artefactos y corriendo `pytest tests/` desde cero (37s, 16/16 tests verdes), no solo lo asumí. `test_data_and_training.py` cubre el generador y la lógica financiera (incluye una prueba explícita de que el óptimo por retorno nunca es peor que un umbral fijo ingenuo). `test_api.py` prueba la API real con `TestClient`, incluyendo casos de validación de Pydantic (422 en geografía inválida, en score fuera de rango) y el flujo completo con LTV.
 
-**Lo que no pude verificar en este entorno:** no hay Docker instalado en esta máquina, así que el `Dockerfile`/`docker-compose.yml` están escritos con cuidado pero no compilados ni ejecutados de punta a punta — revisalos antes de un despliegue real. Tampoco hay un navegador/`chromium-cli` disponible para una captura visual de Streamlit; lo validé indirectamente (arranque limpio sin excepciones, más una réplica independiente del cálculo exacto del simulador).
+**Lo que no pude verificar en este entorno:** no hay Docker instalado en esta máquina, así que el `Dockerfile`/`docker-compose.yml` están escritos con cuidado pero no compilados ni ejecutados de punta a punta — revisalos antes de un despliegue real.
 
 ## Estructura del proyecto
 

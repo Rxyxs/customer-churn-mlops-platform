@@ -1,4 +1,5 @@
 .venv/
+venv/
 __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
@@ -10,3 +11,5 @@ __pycache__/
 mlruns/
 mlflow.db
 .DS_Store
+CLAUDE.md
+.claude/
