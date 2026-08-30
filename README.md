@@ -15,7 +15,7 @@
 
 An end-to-end customer churn prediction system for banking/retail, built around one central idea: **a churn model isn't worth its AUC, it's worth how much money the business stops losing when it's used to decide who to contact.**
 
-## The result, first
+## Business Impact & Key Performance Indicators
 
 Evaluated on a test holdout never seen during training or threshold optimization:
 
@@ -30,6 +30,17 @@ The model nearly doubles the return of an indiscriminate campaign, while contact
 **The threshold isn't an artifact of a favorable split**: `notebooks/02_LTV_Cost_Sensitive_Thresholding.ipynb` verifies this directly — recalculated from scratch against the holdout's own real LTV distribution (a purely diagnostic exercise, never used as the operational decision), the optimum lands at exactly the same point (threshold = 0.03) as the one chosen on validation. See [Phase 4](#phase-4--ltv-weighted-threshold-analysis-on-holdout) for the full detail.
 
 ## Architecture
+
+```mermaid
+flowchart LR
+    A[make_dataset.py<br/>10,000 synthetic customers + LTV] --> B["train.py<br/>LightGBM + MLflow + threshold search"]
+    B --> C[(churn_model.joblib<br/>model_metadata.json)]
+    C --> D["api/main.py<br/>FastAPI"]
+    C --> E["app/streamlit_app.py<br/>ROI simulator"]
+    D <--> E
+    D --> F[[docker-compose.yml<br/>multi-stage, one target per service]]
+    E --> F
+```
 
 ```
 ┌────────────────────────┐

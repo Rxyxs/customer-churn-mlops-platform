@@ -15,7 +15,7 @@
 
 Sistema end-to-end de predicción de fuga de clientes para banca/retail, diseñado alrededor de una idea central: **un modelo de churn no vale por su AUC, vale por cuánto dinero deja de perder la empresa cuando se usa para decidir a quién contactar.**
 
-## El resultado, primero
+## Impacto de Negocio e Indicadores Clave (KPIs)
 
 Evaluado en un holdout de test nunca visto durante entrenamiento ni optimización de umbral:
 
@@ -30,6 +30,17 @@ El modelo casi duplica el retorno de una campaña indiscriminada, contactando a 
 **El umbral no es un artefacto de un split favorable**: `notebooks/02_LTV_Cost_Sensitive_Thresholding.ipynb` lo verifica directamente — recalculado desde cero sobre la distribución real de LTV del propio holdout (un ejercicio puramente diagnóstico, nunca usado como decisión operativa), el óptimo cae exactamente en el mismo punto (umbral = 0.03) que el elegido en validación. Ver [Fase 4](#fase-4--análisis-de-umbral-ponderado-por-ltv-en-holdout) para el detalle completo.
 
 ## Arquitectura
+
+```mermaid
+flowchart LR
+    A[make_dataset.py<br/>10.000 clientes sinteticos + LTV] --> B["train.py<br/>LightGBM + MLflow + busqueda de umbral"]
+    B --> C[(churn_model.joblib<br/>model_metadata.json)]
+    C --> D["api/main.py<br/>FastAPI"]
+    C --> E["app/streamlit_app.py<br/>Simulador de ROI"]
+    D <--> E
+    D --> F[[docker-compose.yml<br/>multietapa, un target por servicio]]
+    E --> F
+```
 
 ```
 ┌────────────────────────┐
