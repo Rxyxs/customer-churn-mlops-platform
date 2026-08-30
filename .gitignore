@@ -11,5 +11,3 @@ __pycache__/
 mlruns/
 mlflow.db
 .DS_Store
-CLAUDE.md
-.claude/
