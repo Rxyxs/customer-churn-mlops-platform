@@ -114,6 +114,49 @@ Esto no reemplaza un `docker compose up --build` real — las rutas de `COPY`, e
 2. **¿El umbral óptimo es un artefacto del split, o generaliza?** Recalculado directamente sobre la distribución de LTV del holdout (puramente diagnóstico — la decisión operativa real sigue siendo la de validación), el óptimo cae **exactamente en el mismo umbral (0.03)** que el elegido en validación, con diferencia de valor financiero de $0.00. Evidencia directa de que el umbral no está sobreajustado a un split particular.
 3. **Curva de ganancia: costo de retención vs. LTV salvado.** Ordenando el holdout de mayor a menor riesgo predicho, el modelo recupera sustancialmente más LTV por el mismo costo de campaña que un orden aleatorio (el lift real, no solo un AUC en abstracto). El óptimo exacto del objetivo financiero completo (barrido cliente a cliente, incluyendo el costo de no actuar sobre un churner real) cae a 12 clientes de distancia del umbral operativo elegido por el grid search de 0.01 de `train.py` — la granularidad de esa búsqueda no deja valor relevante sobre la mesa.
 
+### Fase 5 — Comparación de modelos: regresión logística vs. XGBoost vs. PyTorch MLP
+
+Antes de asentar LightGBM como el modelo realmente servido en producción (Fases 1–4), `src/models/compare_models.py` responde la pregunta de model selection que una plataforma MLOps madura debería poder mostrar con evidencia: **¿cómo se compara contra un baseline más simple y contra deep learning, en exactamente el mismo split 50/30/20 y las mismas features?** Este script es puramente aditivo — no toca `train.py`, la API ni la app de Streamlit; existe para documentar la comparación, no para reemplazar lo que ya está en producción.
+
+Tres enfoques complementarios:
+
+| Enfoque | Librería | Por qué está |
+|---|---|---|
+| Regresión logística (`class_weight="balanced"`) | scikit-learn | Baseline interpretable — coeficientes auditables, piso mínimo de calidad |
+| Árboles con gradient boosting | XGBoost | Un segundo ensamble de árboles (librería distinta a la servida en producción) para verificar que el resultado no es un artefacto específico de LightGBM |
+| MLP con Focal Loss custom | PyTorch | Deep learning con una loss diseñada para el desbalance de clases del churn (~20% positivos), más una comparación controlada de activaciones ReLU vs. GELU vs. Swish sobre la misma arquitectura |
+
+**Resultados en test** (mismo holdout de las Fases 1–4, evaluado al umbral por defecto 0.5 — esta es una comparación de model selection, no el umbral financiero operativo de `train.py`):
+
+| Modelo | ROC-AUC | PR-AUC | F1 |
+|---|---:|---:|---:|
+| Regresión logística | 0.852 | 0.601 | 0.568 |
+| XGBoost | 0.820 | 0.523 | 0.539 |
+| PyTorch MLP (mejor activación, Focal Loss) | 0.845 | 0.580 | 0.240 |
+
+Las tres familias caen en un rango de ROC-AUC similar sobre este dataset sintético — ningún enfoque domina claramente, lo cual es evidencia útil en sí misma: significa que la ventaja de LightGBM en las Fases 1–4 (ROC-AUC 0.82, ajustado para el objetivo *financiero* y no para F1) no está dejando valor sobre la mesa frente a una clase de algoritmo fundamentalmente mejor. El F1 del MLP es más bajo al corte 0.5 sin ajustar porque la Focal Loss recalibra las probabilidades alrededor de los ejemplos difíciles — consistente con el propio hallazgo de `train.py` de que un corte 0.5 ingenuo es el lente equivocado para este problema desde el principio.
+
+**Comparación de activaciones** (MLP, set de validación, misma arquitectura y Focal Loss, solo cambia la no-linealidad):
+
+| Activación | ROC-AUC | PR-AUC | F1 |
+|---|---:|---:|---:|
+| ReLU | 0.849 | 0.591 | 0.251 |
+| GELU | 0.853 | 0.609 | 0.227 |
+| **Swish** | **0.855** | **0.619** | 0.206 |
+
+Swish tuvo el mejor PR-AUC de validación y fue la activación seleccionada para la fila de test del MLP arriba. En este dataset tabular de baja dimensionalidad, la elección de activación mueve el PR-AUC por un margen chico — Swish le gana a ReLU/GELU, pero la brecha no se acerca a explicar la diferencia entre familias de *modelos*. Medido, no asumido.
+
+![Comparación de modelos](reports/figures/roc_pr_comparison.png)
+![Matrices de confusión](reports/figures/confusion_matrices.png)
+![Curvas de loss por activación del MLP](reports/figures/mlp_activation_loss_curves.png)
+![Comparación de métricas por activación del MLP](reports/figures/mlp_activation_comparison.png)
+
+Las métricas de las 3 familias de modelos y las 3 activaciones se persisten en `reports/model_comparison.duckdb` (tablas `model_comparison_metrics` y `mlp_activation_comparison`) — un complemento liviano, consultable con SQL, al tracking/registry de MLflow que `train.py` ya usa para el modelo de producción.
+
+```bash
+python -m src.models.compare_models
+```
+
 ## Estructura del proyecto
 
 ```
@@ -126,17 +169,23 @@ customer-churn-mlops-platform/
 │   ├── data/
 │   │   └── make_dataset.py         # Genera 10,000 clientes sintéticos + LTV
 │   ├── models/
-│   │   └── train.py                # LightGBM + MLflow + umbral por retorno financiero
+│   │   ├── train.py                # LightGBM + MLflow + umbral por retorno financiero
+│   │   └── compare_models.py       # Comparación LR / XGBoost / PyTorch MLP (Fase 5)
 │   ├── api/
 │   │   └── main.py                 # FastAPI: /predict, /predict/batch, /model/info
 │   └── app/
 │       └── streamlit_app.py        # Simulador de ROI + predicción individual
 ├── notebooks/
 │   └── 02_LTV_Cost_Sensitive_Thresholding.ipynb  # LTV en holdout + curva de ganancia
+├── reports/
+│   ├── figures/                    # roc_pr_comparison.png, confusion_matrices.png,
+│   │                                #   mlp_activation_loss_curves.png, mlp_activation_comparison.png
+│   └── model_comparison.duckdb     # métricas de comparación (generado, no versionado)
 ├── tests/
 │   ├── conftest.py                 # Auto-bootstrap de dataset + modelo para CI
 │   ├── test_data_and_training.py
-│   └── test_api.py
+│   ├── test_api.py
+│   └── test_model_comparison.py
 ├── docs/
 │   └── streamlit_preview.png
 ├── Dockerfile                      # Multietapa: builder -> runtime -> api / app
@@ -175,6 +224,9 @@ mlflow ui --backend-store-uri sqlite:///mlflow.db
 
 # Pruebas de integración (auto-genera dataset/modelo si hace falta)
 pytest tests/ -v
+
+# Opcional: comparar LR / XGBoost / PyTorch MLP contra el LightGBM de producción
+python -m src.models.compare_models
 ```
 
 ### Notebook de análisis (opcional, no forma parte de la imagen Docker)
@@ -245,6 +297,9 @@ curl -X POST http://localhost:8000/predict -H "Content-Type: application/json" -
 | **pytest** | Suite de integración (datos, lógica financiera, API real) |
 | **Jupyter / nbconvert** | `notebooks/02_LTV_Cost_Sensitive_Thresholding.ipynb`, ejecutado de punta a punta y comiteado con outputs reales (§Fase 4) |
 | **pandas / numpy / scikit-learn** | Preparación de datos y utilidades de modelado |
+| **XGBoost** | Segunda familia de gradient boosting para la comparación de modelos (§Fase 5) |
+| **PyTorch** | MLP con Focal Loss custom + comparación de activaciones ReLU/GELU/Swish (§Fase 5) |
+| **DuckDB** | Persistencia local, consultable con SQL, de las métricas de comparación (§Fase 5) |
 
 ## Limitaciones conocidas
 

@@ -18,3 +18,7 @@ requests
 # Fase 3 - Tests de integracion
 pytest
 httpx
+
+# Fase 5 - Comparacion de enfoques de modelado (LR / XGBoost / PyTorch MLP)
+torch
+duckdb

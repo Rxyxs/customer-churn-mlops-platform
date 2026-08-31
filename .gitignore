@@ -10,4 +10,6 @@ __pycache__/
 *.pkl
 mlruns/
 mlflow.db
+*.duckdb
+reports/model_comparison_summary.json
 .DS_Store
