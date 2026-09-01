@@ -148,6 +148,9 @@ Swish tuvo el mejor PR-AUC de validación y fue la activación seleccionada para
 
 ![Comparación de modelos](reports/figures/roc_pr_comparison.png)
 ![Matrices de confusión](reports/figures/confusion_matrices.png)
+La versión animada de abajo dibuja la curva real de loss de cada activación cuadro a cuadro, con una etiqueta flotante que sigue su valor actual.
+
+![Curvas de loss por activación del MLP animadas](reports/figures/mlp_activation_loss_curves_animated.gif)
 ![Curvas de loss por activación del MLP](reports/figures/mlp_activation_loss_curves.png)
 ![Comparación de métricas por activación del MLP](reports/figures/mlp_activation_comparison.png)
 

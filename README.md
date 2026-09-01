@@ -150,6 +150,9 @@ On this tabular, low-dimensional dataset the activation choice moves PR-AUC by a
 
 ![Model comparison](reports/figures/roc_pr_comparison.png)
 ![Confusion matrices](reports/figures/confusion_matrices.png)
+The animated version below draws each activation's real loss curve frame by frame, with a floating label tracking its current value.
+
+![MLP activation loss curves animated](reports/figures/mlp_activation_loss_curves_animated.gif)
 ![MLP activation loss curves](reports/figures/mlp_activation_loss_curves.png)
 ![MLP activation metric comparison](reports/figures/mlp_activation_comparison.png)
 

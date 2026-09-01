@@ -17,6 +17,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 import mlflow
 import mlflow.lightgbm
 import numpy as np
@@ -169,6 +170,62 @@ def plot_threshold_curve(
     return output_path
 
 
+def plot_threshold_curve_animated(
+    thresholds: np.ndarray, values: np.ndarray, best_threshold: float, output_path: Path
+) -> Path:
+    """Versión 'racing line chart' de `plot_threshold_curve`: la misma curva real de
+    valor financiero neto vs. umbral, dibujada progresivamente cuadro a cuadro, con
+    una etiqueta flotante en la punta que muestra el umbral y el valor ($) actuales.
+    Mismos `thresholds`/`values` que la versión estática -- sin datos inventados."""
+    n_points = len(thresholds)
+    n_frames = min(n_points, 60)
+    frame_idxs = np.unique(np.linspace(0, n_points - 1, n_frames, dtype=int))
+
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    (line,) = ax.plot([], [], color="#2a78d6", linewidth=2)
+    ax.axvline(best_threshold, color="#eb6834", linestyle="--", label=f"Óptimo = {best_threshold:.2f}")
+    ax.axhline(0, color="#898781", linewidth=1)
+    annotation = ax.annotate(
+        "",
+        xy=(0, 0),
+        xytext=(10, 10),
+        textcoords="offset points",
+        fontsize=9,
+        color="white",
+        bbox=dict(boxstyle="round,pad=0.3", fc="#2a78d6", ec="white", alpha=0.85),
+    )
+
+    ax.set_xlim(thresholds.min(), thresholds.max())
+    margin = (values.max() - values.min()) * 0.1
+    ax.set_ylim(values.min() - margin, values.max() + margin)
+    ax.set_xlabel("Umbral de decisión (probabilidad de churn)")
+    ax.set_ylabel("Valor financiero neto de la campaña ($)")
+    ax.set_title("Retorno financiero vs. umbral de decisión (set de validación)")
+    ax.legend(loc="lower left")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+
+    def update(frame_idx):
+        end = frame_idxs[frame_idx] + 1
+        x = thresholds[:end]
+        y = values[:end]
+        line.set_data(x, y)
+        current_threshold = thresholds[end - 1]
+        current_value = values[end - 1]
+        annotation.xy = (current_threshold, current_value)
+        annotation.set_text(f"umbral={current_threshold:.2f}\nvalor=${current_value:,.0f}")
+        return [line, annotation]
+
+    ani = FuncAnimation(fig, update, frames=len(frame_idxs), interval=120, blit=False)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ani.save(output_path, writer="pillow")
+    plt.close(fig)
+    plt.style.use("default")
+    return output_path
+
+
 def evaluate_at_threshold(y_true: np.ndarray, y_proba: np.ndarray, threshold: float) -> dict:
     y_pred = (y_proba >= threshold).astype(int)
     return {
@@ -225,6 +282,11 @@ def run_training(data_path: Path = DATA_PATH) -> dict:
 
         curve_path = plot_threshold_curve(thresholds, values, best_threshold, THRESHOLD_CURVE_PATH)
         mlflow.log_artifact(str(curve_path))
+        animated_curve_path = plot_threshold_curve_animated(
+            thresholds, values, best_threshold,
+            THRESHOLD_CURVE_PATH.with_name(THRESHOLD_CURVE_PATH.stem + "_animated.gif"),
+        )
+        mlflow.log_artifact(str(animated_curve_path))
 
         try:
             mlflow.lightgbm.log_model(model, name="model", registered_model_name="churn_lightgbm")

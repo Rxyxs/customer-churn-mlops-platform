@@ -39,6 +39,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 import numpy as np
 import pandas as pd
 import torch
@@ -295,6 +296,69 @@ def plot_mlp_activation_curves(histories: dict[str, dict], output_path: Path) ->
     return output_path
 
 
+def plot_mlp_activation_curves_animated(histories: dict[str, dict], output_path: Path) -> Path:
+    """Versión 'racing line chart' de `plot_mlp_activation_curves`: las mismas curvas
+    reales de loss (train/val) por activación, dibujadas progresivamente cuadro a
+    cuadro, con una etiqueta flotante que sigue la punta de cada línea de val loss
+    mostrando su valor numérico en la época actual. Mismos datos que la versión
+    estática -- sin valores inventados."""
+    n_epochs = max(len(h["val_loss"]) for h in histories.values())
+    n_frames = min(n_epochs, 60)
+    # Épocas (índices) que se revelan en cada cuadro, submuestreando si hay más
+    # épocas reales que cuadros.
+    frame_epochs = np.unique(np.linspace(1, n_epochs, n_frames, dtype=int))
+
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    lines = {}
+    annotations = {}
+    for activation, history in histories.items():
+        color = ACTIVATION_COLORS.get(activation, "#555555")
+        (val_line,) = ax.plot([], [], label=f"{activation} (val)", color=color, linewidth=2)
+        (train_line,) = ax.plot([], [], label=f"{activation} (train)", color=color, linewidth=1, linestyle="--", alpha=0.6)
+        lines[activation] = (val_line, train_line)
+        annotations[activation] = ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(10, 0),
+            textcoords="offset points",
+            fontsize=9,
+            color="white",
+            va="center",
+            bbox=dict(boxstyle="round,pad=0.3", fc=color, ec="white", alpha=0.85),
+        )
+
+    ax.set_xlim(1, n_epochs)
+    all_losses = [v for h in histories.values() for v in h["val_loss"] + h["train_loss"]]
+    ax.set_ylim(min(all_losses) * 0.9, max(all_losses) * 1.1)
+    ax.set_xlabel("Época")
+    ax.set_ylabel("Focal Loss")
+    ax.set_title("MLP: curvas de loss por activación (ReLU vs. GELU vs. Swish)")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+
+    def update(frame_idx):
+        current_epoch = int(frame_epochs[frame_idx])
+        x = np.arange(1, current_epoch + 1)
+        for activation, history in histories.items():
+            val_line, train_line = lines[activation]
+            val_line.set_data(x, history["val_loss"][:current_epoch])
+            train_line.set_data(x, history["train_loss"][:current_epoch])
+            current_val = history["val_loss"][current_epoch - 1]
+            annotations[activation].xy = (current_epoch, current_val)
+            annotations[activation].set_text(f"{activation}: {current_val:.3f}")
+        return [item for pair in lines.values() for item in pair] + list(annotations.values())
+
+    ani = FuncAnimation(fig, update, frames=len(frame_epochs), interval=120, blit=False)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ani.save(output_path, writer="pillow")
+    plt.close(fig)
+    plt.style.use("default")
+    return output_path
+
+
 def plot_activation_metric_bars(activation_metrics: dict[str, dict], output_path: Path) -> Path:
     fig, ax = plt.subplots(figsize=(7, 5))
     activations = list(activation_metrics.keys())
@@ -428,6 +492,7 @@ def run_comparison(data_path: Path = DATA_PATH) -> dict:
     plot_roc_pr_comparison(results, y_test, FIGURES_DIR / "roc_pr_comparison.png")
     plot_confusion_matrices(results, y_test, FIGURES_DIR / "confusion_matrices.png")
     plot_mlp_activation_curves(histories, FIGURES_DIR / "mlp_activation_loss_curves.png")
+    plot_mlp_activation_curves_animated(histories, FIGURES_DIR / "mlp_activation_loss_curves_animated.gif")
     plot_activation_metric_bars(activation_metrics, FIGURES_DIR / "mlp_activation_comparison.png")
 
     persist_to_duckdb(comparison_rows, activation_rows, DUCKDB_PATH)
