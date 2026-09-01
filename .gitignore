@@ -4,7 +4,9 @@ __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
 .env
-/data/
+data/raw/
+data/processed/*.joblib
+data/processed/*.json
 *.csv
 *.joblib
 *.pkl
