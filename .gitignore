@@ -15,3 +15,6 @@ mlflow.db
 *.duckdb
 reports/model_comparison_summary.json
 .DS_Store
+
+# Checkpoints de entrenamiento del MLP
+/checkpoints/

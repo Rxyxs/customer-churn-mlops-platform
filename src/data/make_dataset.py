@@ -1,9 +1,24 @@
-"""Generador del dataset sintético de clientes bancarios para el sistema de churn.
+"""Dataset de clientes bancarios para el sistema de churn.
 
-10,000 clientes con un perfil de riesgo de fuga realista (antigüedad, actividad,
-quejas, satisfacción, número de productos) y el cálculo de LTV (Lifetime Value)
-proyectado que alimenta la optimización de umbral por retorno financiero en
-`src/models/train.py`.
+Fuente principal (real): "Bank Customer Churn" de Kaggle
+(`radheshyamkollipara/bank-customer-churn`, archivo `Customer-Churn-Records.csv`):
+10.000 clientes reales de un banco europeo (Francia, Alemania, España) con su
+atributo de fuga real (`Exited`). `build_customers()` lo descarga con la API de
+Kaggle si no está en `data/raw/`, y lo lleva al esquema del proyecto.
+
+Lo que el dataset real NO trae, y por eso se calcula con supuestos explícitos:
+- `monthly_fee_revenue`: ingreso mensual del cliente, estimado como
+  15 + 8 x productos + 0,0008 x balance (USD). Es un supuesto de negocio, no un dato.
+- `ltv`: ingreso mensual x meses de vida útil futura esperados según actividad.
+Ninguna de las dos entra como feature del modelo; solo alimentan el valor financiero.
+
+`num_complaints` viene de la columna real `Complain`, que es una filtración casi
+perfecta del target (2.034 de los 2.038 clientes que se fueron tienen queja, contra
+10 de 7.962 que se quedaron): la queja se registra junto con la salida. Se conserva
+en el dataset pero `src/models/train.py` la excluye de las features.
+
+`generate_customers()` es el generador sintético original, con el mismo esquema que
+los datos reales; se usa como respaldo cuando no hay credenciales de Kaggle (CI).
 
 Supuesto de negocio para el LTV: un cliente activo tiene por delante más meses de
 vida útil esperados que uno inactivo (más "pegado" al banco). El LTV proyectado es
@@ -23,7 +38,10 @@ OUTPUT_PATH = PROJECT_ROOT / "data" / "raw" / "customers.csv"
 N_CUSTOMERS = 10_000
 RANDOM_SEED = 42
 
-GEOGRAPHIES = ["North", "South", "East", "West", "Central"]
+GEOGRAPHIES = ["France", "Germany", "Spain"]
+CARD_TYPES = ["SILVER", "GOLD", "PLATINUM", "DIAMOND"]
+KAGGLE_DATASET = "radheshyamkollipara/bank-customer-churn"
+REAL_RAW_PATH = PROJECT_ROOT / "data" / "raw" / "Customer-Churn-Records.csv"
 GENDERS = ["Male", "Female"]
 
 # Meses de vida útil FUTURA esperados, según el nivel de actividad del cliente
@@ -115,19 +133,77 @@ def generate_customers(n_customers: int = N_CUSTOMERS, seed: int = RANDOM_SEED) 
         "estimated_salary": estimated_salary,
         "num_complaints": num_complaints,
         "satisfaction_score": satisfaction_score,
+        "card_type": rng.choice(CARD_TYPES, size=n_customers),
+        "points_earned": rng.integers(119, 1001, size=n_customers),
         "monthly_fee_revenue": monthly_fee_revenue,
         "ltv": ltv,
         "churn": churn,
     })
 
 
+def monthly_fee_revenue_assumption(num_products: pd.Series, balance: pd.Series) -> pd.Series:
+    """Supuesto de ingreso mensual (USD): el dataset real no trae ingresos por cliente."""
+    return (15 + 8 * num_products + 0.0008 * balance).clip(lower=5).round(2)
+
+
+def ltv_assumption(monthly_fee_revenue: pd.Series, is_active_member: pd.Series) -> pd.Series:
+    remaining = np.where(is_active_member == 1, EXPECTED_FUTURE_MONTHS["active"], EXPECTED_FUTURE_MONTHS["inactive"])
+    return (monthly_fee_revenue * np.maximum(remaining, MIN_REMAINING_MONTHS)).round(2)
+
+
+def download_real(path: Path = REAL_RAW_PATH) -> Path:
+    """Descarga el CSV real con la API de Kaggle (requiere ~/.kaggle/kaggle.json)."""
+    from kaggle.api.kaggle_api_extended import KaggleApi
+
+    api = KaggleApi()
+    api.authenticate()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    api.dataset_download_files(KAGGLE_DATASET, path=str(path.parent), unzip=True)
+    return path
+
+
+def real_to_schema(raw: pd.DataFrame) -> pd.DataFrame:
+    """Lleva el CSV real de Kaggle al esquema del proyecto."""
+    df = pd.DataFrame({
+        "customer_id": "C-" + raw["CustomerId"].astype(str),
+        "credit_score": raw["CreditScore"],
+        "geography": raw["Geography"],
+        "gender": raw["Gender"],
+        "age": raw["Age"],
+        "tenure_years": raw["Tenure"],
+        "balance": raw["Balance"],
+        "num_products": raw["NumOfProducts"],
+        "has_credit_card": raw["HasCrCard"],
+        "is_active_member": raw["IsActiveMember"],
+        "estimated_salary": raw["EstimatedSalary"],
+        "num_complaints": raw["Complain"],
+        "satisfaction_score": raw["Satisfaction Score"],
+        "card_type": raw["Card Type"],
+        "points_earned": raw["Point Earned"],
+    })
+    df["monthly_fee_revenue"] = monthly_fee_revenue_assumption(df["num_products"], df["balance"])
+    df["ltv"] = ltv_assumption(df["monthly_fee_revenue"], df["is_active_member"])
+    df["churn"] = raw["Exited"].astype(int)
+    return df
+
+
+def build_customers(allow_synthetic: bool = True) -> tuple[pd.DataFrame, str]:
+    """Devuelve (dataset, fuente). Usa el CSV real; si no está, intenta bajarlo de
+    Kaggle; si no hay credenciales y `allow_synthetic`, cae al generador sintético."""
+    if not REAL_RAW_PATH.exists():
+        try:
+            download_real()
+        except Exception as exc:  # sin credenciales o sin red
+            if not allow_synthetic:
+                raise
+            print(f"Aviso: no se pudo descargar el dataset real ({exc}); se usa el generador sintético.")
+            return generate_customers(), "synthetic"
+    return real_to_schema(pd.read_csv(REAL_RAW_PATH)), "real"
+
+
 if __name__ == "__main__":
-    df = generate_customers()
+    df, source = build_customers()
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_PATH, index=False)
-
-    print(f"Clientes generados: {len(df):,}")
-    print(f"Tasa de churn: {df['churn'].mean():.2%}")
-    print(f"LTV promedio: ${df['ltv'].mean():,.2f}")
-    print(f"LTV total en riesgo (suma de LTV de clientes que fugan): ${df.loc[df['churn'] == 1, 'ltv'].sum():,.2f}")
+    print(f"Fuente: {source} | clientes: {len(df):,} | tasa de churn: {df['churn'].mean():.2%}")
     print(f"Guardado en {OUTPUT_PATH}")

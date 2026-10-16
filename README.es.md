@@ -17,17 +17,20 @@ Sistema end-to-end de predicción de fuga de clientes para banca/retail, diseña
 
 ## Impacto de Negocio e Indicadores Clave (KPIs)
 
-Evaluado en un holdout de test nunca visto durante entrenamiento ni optimización de umbral:
+Entrenado con **10.000 clientes bancarios reales** (Kaggle "Bank Customer Churn", Francia / Alemania / España, churn 20,4%) y evaluado en un holdout de 2.000 clientes nunca visto durante el entrenamiento ni la selección de umbral. El valor se mide contra no hacer ninguna campaña (que pierde $1,15 millones de LTV de churners en el holdout):
 
-| Estrategia | Valor financiero neto | Clientes contactados |
+| Estrategia | LTV recuperado, neto del costo de campaña | Clientes contactados |
 |---|---:|---:|
-| No contactar a nadie | −$809,055 | 0% |
-| Contactar a todos (sin modelo) | +$42,717 | 100% |
-| **Umbral óptimo del modelo** | **+$75,847** | 78.6% |
+| No contactar a nadie | $0 | 0% |
+| Contactar a todos (sin modelo) | +$143.842 | 100% |
+| **Umbral del modelo (0,24, elegido en validación)** | **+$189.930** | 41,7% |
 
-El modelo casi duplica el retorno de una campaña indiscriminada, contactando a menos gente. Ese es el producto: no "quién va a fugarse", sino "a quién conviene ofrecerle algo, y cuánto vale hacerlo".
+El modelo recupera 32% más que una campaña indiscriminada contactando a menos de la mitad de los clientes. El costo de la oferta ($100), la tasa de retención (30%) y el LTV son supuestos de negocio, porque el dataset real trae la fuga pero no los ingresos; están documentados en `src/data/make_dataset.py` y `src/models/train.py`.
 
-**El umbral no es un artefacto de un split favorable**: `notebooks/02_LTV_Cost_Sensitive_Thresholding.ipynb` lo verifica directamente — recalculado desde cero sobre la distribución real de LTV del propio holdout (un ejercicio puramente diagnóstico, nunca usado como decisión operativa), el óptimo cae exactamente en el mismo punto (umbral = 0.03) que el elegido en validación. Ver [Fase 4](#fase-4--análisis-de-umbral-ponderado-por-ltv-en-holdout) para el detalle completo.
+Dos hallazgos del paso a datos reales:
+
+- **La columna `Complain` es una filtración.** 2.034 de los 2.038 churners tienen una queja, contra 10 de los 7.962 que se quedaron: la queja se registra junto con la salida. Con ella, LightGBM llega a ROC-AUC 1,000; sin ella, **0,852**. Se conserva en los datos y se excluye de las features, y `train.py` registra ambos números en cada corrida.
+- **El objetivo financiero anterior contaba doble.** Le abonaba a cada churner contactado el 30% de su LTV pero nunca le cargaba el 70% que se va igual, así que cada contacto valía 1,3 × LTV en vez de 0,3 × LTV. Eso empujaba el umbral "óptimo" a 0,03 (contactar al 90% de los clientes). Corregido, el punto de equilibrio es `p_churn = costo / (tasa_de_éxito × LTV)`, unos 0,12 para un cliente típico, y el umbral queda en 0,24.
 
 ## Arquitectura
 
@@ -44,7 +47,7 @@ flowchart LR
 
 ```
 ┌────────────────────────┐
-│  make_dataset.py        │  10,000 clientes sintéticos + LTV proyectado
+│  make_dataset.py        │  10.000 clientes reales (Kaggle) + LTV supuesto
 └────────────┬─────────────┘
              │
              ▼
@@ -78,11 +81,11 @@ Este proyecto se construyó en fases, entregadas y verificadas una por una — n
 
 ### Fase 1 — Datos y modelado
 
-`src/data/make_dataset.py` genera 10,000 clientes bancarios sintéticos con un modelo de riesgo de fuga logístico (antigüedad, satisfacción, quejas, actividad, número de productos) y un **LTV proyectado** (ingreso mensual actual × meses de vida útil futura esperados, según actividad).
+`src/data/make_dataset.py` carga el dataset real de Kaggle ([Bank Customer Churn](https://www.kaggle.com/datasets/radheshyamkollipara/bank-customer-churn), descargado con la API de Kaggle a `data/raw/`, que está en el gitignore) y lo lleva al esquema del proyecto: score crediticio, país, género, edad, antigüedad, balance, productos, tarjeta, actividad, salario, satisfacción, tipo de tarjeta, puntos de fidelización y el indicador real de salida. Lo que los datos no traen son los ingresos, así que `monthly_fee_revenue` (15 + 8 × productos + 0,0008 × balance) y el **LTV proyectado** (ingreso mensual × meses futuros esperados, 48 si está activo y 18 si no) son supuestos explícitos, usados solo para el valor financiero y nunca como features. El generador sintético original queda como respaldo con el mismo esquema, para correr la CI sin credenciales de Kaggle.
 
-`src/models/train.py` entrena LightGBM sobre un split 50/30/20 (train / val / test), trackea todo en MLflow (SQLite local, con Model Registry funcionando), y — el corazón del proyecto — busca el **umbral de decisión que maximiza el retorno financiero neto** en validación, no el que maximiza F1 o accuracy.
+`src/models/train.py` entrena LightGBM sobre un split estratificado 50/30/20 (train / val / test), trackea todo en MLflow (SQLite local, con Model Registry funcionando), y busca el **umbral de decisión que maximiza el retorno financiero neto** en validación, no el que maximiza F1 o accuracy. El objetivo, por cliente: un churner no contactado pierde su LTV; uno contactado se retiene con probabilidad `tasa_de_éxito` y si no se pierde igual; cada contacto cuesta el precio de la campaña. Las features excluyen el ID, los supuestos de LTV e ingreso, y `num_complaints` (la filtración de arriba); la misma corrida entrena una copia con la filtración y registra sus métricas, para que la inflación quede a la vista.
 
-**Esto no salió bien a la primera.** La primera versión del umbral óptimo era degenerado: 0.01, básicamente "contactar a todo el mundo". La razón, una vez diagnosticada: con la asimetría de costos de este problema (no contactar a un churner real cuesta su LTV completo; contactar a alguien que no lo era cuesta solo el precio de la campaña), el punto de indiferencia matemático es `costo / (LTV × (1 + tasa_de_éxito))` — y con un costo de campaña trivial frente al LTV en juego, ese punto cae por debajo de casi cualquier probabilidad predicha, así que "contactar a todos" gana matemáticamente sin que el modelo aporte nada. Ajustar solo el costo tampoco alcanzaba: subirlo demasiado volvía negativo el valor en *cualquier* umbral. La solución fue dos cambios combinados: un costo de campaña realista ($100, una oferta real — descuento de comisiones, bono — no una llamada trivial) y un modelo de riesgo con menos ruido (ROC-AUC 0.75 → 0.82), hasta que el óptimo cayó en una zona genuinamente interior y rentable. El detalle completo está comentado en `src/models/train.py`.
+Métricas de test: ROC-AUC 0,852, PR-AUC 0,687. Umbral 0,24 en validación; recalculado sobre test (solo diagnóstico) sería 0,19, y la curva es tan plana ahí que la diferencia cuesta $6.300 (0,7%).
 
 ### Fase 2 — API y UI
 
@@ -94,7 +97,7 @@ Este proyecto se construyó en fases, entregadas y verificadas una por una — n
 
 `Dockerfile` multietapa: `builder` (compila con `build-essential`/`cmake`) → `runtime` (base mínima compartida, con `libgomp1` instalado — sin esa librería, LightGBM falla al importar en Debian slim con `libgomp.so.1: cannot open shared object file`, un gotcha real que vale la pena dejar documentado) → `api` y `app` como targets finales del mismo Dockerfile, para no duplicar la definición de dependencias. `docker-compose.yml` levanta ambos servicios, monta `data/` como volumen de solo lectura (los artefactos del modelo no se hornean en la imagen), y usa un healthcheck sin `curl` (vía `urllib` de la stdlib) para que `app` espere a que `api` esté realmente lista.
 
-`tests/`: suite de integración con `pytest`. `conftest.py` genera el dataset y entrena el modelo automáticamente si no existen — verificado de verdad borrando todos los artefactos y corriendo `pytest tests/` desde cero (16/16 tests verdes), no solo asumido.
+`tests/`: suite de integración con `pytest`. `conftest.py` genera el dataset y entrena el modelo automáticamente si no existen — verificado de verdad borrando todos los artefactos y corriendo `pytest tests/` desde cero (27/27 tests verdes), no solo asumido. Sin `data/raw/customers.csv` intenta la API de Kaggle y, si no hay credenciales, cae al generador sintético.
 
 **Verificación de Docker sin un daemon disponible.** Este entorno de ejecución no tiene Docker instalado (ni Docker Desktop ni el CLI), así que `docker compose up --build` en sí no se pudo correr literalmente. En vez de dejarlo en "revisalo antes de un despliegue real" sin más, se validó todo lo que sí se puede validar sin el daemon, replicando cada etapa del Dockerfile por fuera del contenedor:
 
@@ -102,7 +105,7 @@ Este proyecto se construyó en fases, entregadas y verificadas una por una — n
 2. **Los comandos `CMD` exactos del Dockerfile, corridos tal cual** — `uvicorn src.api.main:app --host 0.0.0.0 --port 8000` y `streamlit run src/app/streamlit_app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true` arrancan y sirven correctamente en ese venv aislado.
 3. **El comando exacto del `healthcheck`** de `docker-compose.yml` (`python -c "import urllib.request; urllib.request.urlopen(...)"`) ejecutado contra la API corriendo — responde `{"status":"ok","model_loaded":true}`.
 4. **Pipeline completo de punta a punta** (`make_dataset.py` → `train.py` → servir con el `CMD` real) corrido en el venv aislado, sin artefactos heredados de otra instalación.
-5. **Los 16 tests de integración**, corridos desde cero contra el modelo recién entrenado.
+5. **Todos los tests de integración**, corridos desde cero contra el modelo recién entrenado.
 
 Esto no reemplaza un `docker compose up --build` real — las rutas de `COPY`, el orden de las etapas multietapa y el propio motor de Docker siguen sin ejecutarse literalmente — pero cubre exactamente el código y los comandos que terminan corriendo dentro del contenedor, con una confianza mucho más alta que "está escrito con cuidado". **Recomendación**: antes de un despliegue real, correr `docker compose up --build` una vez en una máquina con Docker instalado como último paso de verificación.
 
@@ -110,9 +113,9 @@ Esto no reemplaza un `docker compose up --build` real — las rutas de `COPY`, e
 
 `notebooks/02_LTV_Cost_Sensitive_Thresholding.ipynb` (ejecutado de punta a punta, cero errores) profundiza en tres preguntas que `train.py` no muestra en detalle:
 
-1. **¿Cómo se distribuye el LTV en el holdout?** El churner real promedio vale $2,053, con una cola pesada (desviación estándar ~$1,730 del mismo orden que la media) — consistente con por qué el umbral se elige en un set de validación grande (30%) antes de tocar el holdout.
-2. **¿El umbral óptimo es un artefacto del split, o generaliza?** Recalculado directamente sobre la distribución de LTV del holdout (puramente diagnóstico — la decisión operativa real sigue siendo la de validación), el óptimo cae **exactamente en el mismo umbral (0.03)** que el elegido en validación, con diferencia de valor financiero de $0.00. Evidencia directa de que el umbral no está sobreajustado a un split particular.
-3. **Curva de ganancia: costo de retención vs. LTV salvado.** Ordenando el holdout de mayor a menor riesgo predicho, el modelo recupera sustancialmente más LTV por el mismo costo de campaña que un orden aleatorio (el lift real, no solo un AUC en abstracto). El óptimo exacto del objetivo financiero completo (barrido cliente a cliente, incluyendo el costo de no actuar sobre un churner real) cae a 12 clientes de distancia del umbral operativo elegido por el grid search de 0.01 de `train.py` — la granularidad de esa búsqueda no deja valor relevante sobre la mesa.
+1. **¿Cómo se distribuye el LTV en el holdout?** El churner real promedio vale $2.809, con cola pesada (desviación estándar ~$2.030, del mismo orden que la media); hay $1,15 millones de LTV en riesgo en el holdout.
+2. **¿El umbral es un artefacto del split?** Validación elige 0,24; el óptimo recalculado sobre el holdout (solo diagnóstico, nunca la decisión operativa) es 0,19. La curva de valor es plana cerca del máximo, así que la diferencia cuesta $6.300, el 0,7% del total.
+3. **Curva de ganancia y deciles.** Ordenados por riesgo predicho, el primer decil tiene 81% de churn real y el último 2,5%. Solo los cinco primeros deciles pagan la oferta; del sexto en adelante una oferta cuesta más de lo que recupera. En el umbral operativo la campaña contacta a 834 clientes (41,7%) y recupera $189.930 netos; el óptimo exacto cliente a cliente contacta a 960 y recupera $7.000 más.
 
 ### Fase 5 — Comparación de modelos: regresión logística vs. XGBoost vs. PyTorch MLP
 
@@ -126,25 +129,28 @@ Tres enfoques complementarios:
 | Árboles con gradient boosting | XGBoost | Un segundo ensamble de árboles (librería distinta a la servida en producción) para verificar que el resultado no es un artefacto específico de LightGBM |
 | MLP con Focal Loss custom | PyTorch | Deep learning con una loss diseñada para el desbalance de clases del churn (~20% positivos), más una comparación controlada de activaciones ReLU vs. GELU vs. Swish sobre la misma arquitectura |
 
-**Resultados en test** (mismo holdout de las Fases 1–4, evaluado al umbral por defecto 0.5 — esta es una comparación de model selection, no el umbral financiero operativo de `train.py`):
+**Resultados en test** (mismo holdout de las Fases 1–4, al umbral por defecto 0,5; una comparación de selección de modelos, no el umbral financiero operativo):
 
 | Modelo | ROC-AUC | PR-AUC | F1 |
 |---|---:|---:|---:|
-| Regresión logística | 0.852 | 0.601 | 0.568 |
-| XGBoost | 0.820 | 0.523 | 0.539 |
-| PyTorch MLP (mejor activación, Focal Loss) | 0.845 | 0.580 | 0.240 |
+| Regresión logística | 0,772 | 0,466 | 0,504 |
+| XGBoost | 0,845 | 0,675 | 0,600 |
+| PyTorch MLP (Swish, Focal Loss) | 0,855 | 0,687 | 0,462 |
+| LightGBM (servido, de `train.py`) | 0,852 | 0,687 | — |
 
-Las tres familias caen en un rango de ROC-AUC similar sobre este dataset sintético — ningún enfoque domina claramente, lo cual es evidencia útil en sí misma: significa que la ventaja de LightGBM en las Fases 1–4 (ROC-AUC 0.82, ajustado para el objetivo *financiero* y no para F1) no está dejando valor sobre la mesa frente a una clase de algoritmo fundamentalmente mejor. El F1 del MLP es más bajo al corte 0.5 sin ajustar porque la Focal Loss recalibra las probabilidades alrededor de los ejemplos difíciles — consistente con el propio hallazgo de `train.py` de que un corte 0.5 ingenuo es el lente equivocado para este problema desde el principio.
+Con datos reales el baseline lineal queda claramente atrás (ROC-AUC 0,77): la señal de fuga aquí no es lineal (la edad y el número de productos actúan por tramos, no de forma monótona). Los tres modelos no lineales empatan dentro de 0,01 de ROC-AUC, así que LightGBM se mantiene como modelo servido por sus categóricas nativas y su velocidad. El F1 más bajo del MLP al corte 0,5 viene de que la Focal Loss cambia la escala de las probabilidades, y por eso la decisión operativa usa un umbral financiero y no 0,5.
 
-**Comparación de activaciones** (MLP, set de validación, misma arquitectura y Focal Loss, solo cambia la no-linealidad):
+El MLP entrena con early stopping sobre la loss de validación (nunca test): mínimo 100 épocas, paciencia 20, ReduceLROnPlateau, y se restauran los pesos de la mejor época. Se guarda un checkpoint por época (escritura atómica, con huella de datos y configuración), y una corrida interrumpida retoma desde él; un test interrumpe el entrenamiento a mitad y verifica que la corrida retomada coincide con una limpia. Las mejores épocas fueron 30 (ReLU), 53 (GELU) y 61 (Swish) de 100 corridas.
+
+**Comparación de activaciones** (set de validación, misma arquitectura y Focal Loss):
 
 | Activación | ROC-AUC | PR-AUC | F1 |
 |---|---:|---:|---:|
-| ReLU | 0.849 | 0.591 | 0.251 |
-| GELU | 0.853 | 0.609 | 0.227 |
-| **Swish** | **0.855** | **0.619** | 0.206 |
+| ReLU | 0,848 | 0,679 | 0,423 |
+| GELU | 0,858 | 0,693 | 0,489 |
+| **Swish** | **0,861** | **0,696** | 0,471 |
 
-Swish tuvo el mejor PR-AUC de validación y fue la activación seleccionada para la fila de test del MLP arriba. En este dataset tabular de baja dimensionalidad, la elección de activación mueve el PR-AUC por un margen chico — Swish le gana a ReLU/GELU, pero la brecha no se acerca a explicar la diferencia entre familias de *modelos*. Medido, no asumido.
+Swish tuvo el mejor PR-AUC de validación y fue la seleccionada para la fila de test. La diferencia entre activaciones (0,017 de PR-AUC) es menor que la brecha con el baseline lineal.
 
 ![Comparación de modelos](reports/figures/roc_pr_comparison.png)
 ![Matrices de confusión](reports/figures/confusion_matrices.png)
@@ -170,7 +176,7 @@ customer-churn-mlops-platform/
 │                                    #   figures/threshold_vs_value.png (generados)
 ├── src/
 │   ├── data/
-│   │   └── make_dataset.py         # Genera 10,000 clientes sintéticos + LTV
+│   │   └── make_dataset.py         # Carga los datos reales de Kaggle (+ respaldo sintético) + LTV
 │   ├── models/
 │   │   ├── train.py                # LightGBM + MLflow + umbral por retorno financiero
 │   │   └── compare_models.py       # Comparación LR / XGBoost / PyTorch MLP (Fase 5)
@@ -210,7 +216,7 @@ pip install -r requirements.txt
 ## Uso
 
 ```bash
-# 1. Generar el dataset sintético
+# 1. Construir el dataset (descarga los datos reales de Kaggle; requiere ~/.kaggle/kaggle.json)
 python -m src.data.make_dataset
 
 # 2. Entrenar (LightGBM + MLflow + optimización de umbral financiero)
@@ -280,13 +286,15 @@ Ejemplo:
 
 ```bash
 curl -X POST http://localhost:8000/predict -H "Content-Type: application/json" -d '{
-  "credit_score": 550, "geography": "West", "gender": "Male", "age": 35,
-  "tenure_years": 0, "balance": 500, "num_products": 1, "has_credit_card": false,
-  "is_active_member": false, "estimated_salary": 40000, "num_complaints": 5,
-  "satisfaction_score": 1, "monthly_fee_revenue": 25.0, "ltv": 450
+  "credit_score": 550, "geography": "Germany", "gender": "Female", "age": 52,
+  "tenure_years": 1, "balance": 110000, "num_products": 1, "has_credit_card": false,
+  "is_active_member": false, "estimated_salary": 40000, "satisfaction_score": 2,
+  "card_type": "SILVER", "points_earned": 400, "ltv": 2500
 }'
-# {"churn_probability":0.9741,"optimal_threshold":0.03,"recommended_action":"contact","expected_financial_value":31.51}
+# {"churn_probability":0.9742,"optimal_threshold":0.24,"recommended_action":"contact","expected_financial_value":630.66}
 ```
+
+`expected_financial_value` es el valor esperado de contactar a este cliente frente a no contactarlo: `p_churn × tasa_de_éxito × LTV − costo`.
 
 ## Stack técnico
 
@@ -306,9 +314,11 @@ curl -X POST http://localhost:8000/predict -H "Content-Type: application/json" -
 
 ## Limitaciones conocidas
 
-- Los datos son sintéticos (generador propio, sin conexión a un dataset bancario real) — el patrón de riesgo y el LTV son supuestos de diseño, documentados y calibrados, no observaciones.
+- Los clientes y la fuga son reales, pero los ingresos y el LTV no: el dataset no trae ingresos, así que ambos son supuestos documentados. Los números financieros muestran cómo funciona la decisión bajo esos supuestos, no el retorno real del banco.
+- El dataset es una foto anónima sin fechas, así que el split es estratificado y no temporal; un sistema en producción validaría sobre meses posteriores.
+- `Complain` se excluye por ser una filtración; el puntaje de satisfacción y los puntos de fidelización podrían tener el mismo problema en forma más débil, porque el dataset no dice cuándo se registraron.
 - El umbral óptimo depende de `campaign_cost` y `retention_success_rate`, que son supuestos de negocio ajustables (por eso el simulador de ROI existe: para explorar qué pasa si cambian).
-- La selección de umbral en un set de validación de tamaño moderado es sensible a la cola pesada del LTV — un puñado de clientes de alto valor puede mover el total en decenas de miles de dólares. El §Fase 4 mide directamente esta sensibilidad (comparando el umbral de validación contra el recalculado en holdout) en vez de solo advertirla, y la encuentra estable en este dataset; un sistema en producción debería seguir monitoreando esta estabilidad con datos reales.
+- La selección de umbral en un set de validación de tamaño moderado es sensible a la cola pesada del LTV — un puñado de clientes de alto valor puede mover el total en decenas de miles de dólares. El §Fase 4 mide directamente esta sensibilidad (comparando el umbral de validación contra el recalculado en holdout) en vez de solo advertirla, y encuentra una diferencia chica y barata (0,24 vs. 0,19, 0,7% del valor); un sistema en producción debería seguir monitoreando esta estabilidad con datos reales.
 - La verificación de Docker en este entorno fue por equivalencia (venv aislado + comandos exactos del `Dockerfile`), no una ejecución literal de `docker compose up --build` — ver §Fase 3 para el detalle exacto de qué se validó y qué falta confirmar en una máquina con Docker.
 
 ## Autor

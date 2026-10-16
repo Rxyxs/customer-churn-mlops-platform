@@ -36,7 +36,13 @@ MLFLOW_TRACKING_URI = f"sqlite:///{(PROJECT_ROOT / 'mlflow.db').as_posix()}"
 TARGET_COLUMN = "churn"
 LTV_COLUMN = "ltv"
 ID_COLUMN = "customer_id"
-CATEGORICAL_FEATURES = ["geography", "gender"]
+CATEGORICAL_FEATURES = ["geography", "gender", "card_type"]
+# Columnas que no entran como features:
+# - monthly_fee_revenue: supuesto de ingreso (el dataset real no lo trae), solo para el LTV.
+# - num_complaints: en el dataset real (`Complain`) es una filtración casi perfecta del target;
+#   la queja se registra junto con la salida, así que no está disponible antes de la decisión.
+NON_FEATURE_COLUMNS = ("monthly_fee_revenue",)
+LEAKY_COLUMNS = ("num_complaints",)
 
 # --- Supuestos de negocio para la optimización financiera del umbral ---
 # Costo de una oferta de retención dirigida a un cliente (descuento de comisiones,
@@ -44,13 +50,12 @@ CATEGORICAL_FEATURES = ["geography", "gender"]
 CAMPAIGN_COST = 100.0
 # Probabilidad de que la oferta efectivamente retenga a un cliente que iba a fugarse.
 RETENTION_SUCCESS_RATE = 0.30
-# Con estos supuestos, ofrecer la campaña a TODOS los clientes ya es rentable en
-# agregado (hay suficiente LTV en riesgo) -- pero de forma ineficiente, porque
-# desperdicia el costo de campaña en clientes que nunca se iban a fugar. El valor del
-# modelo no es "convertir una pérdida en ganancia": es concentrar el gasto donde el
-# retorno es mayor. El umbral óptimo por retorno financiero captura casi toda la
-# recall relevante contactando bastante menos gente que "a todos", por eso su valor
-# neto termina siendo sustancialmente mayor que el de la campaña indiscriminada.
+# Contactar a un cliente vale, en esperanza, p_churn x success_rate x LTV - costo: la
+# oferta solo cambia el desenlace del 30% de los churners contactados; el otro 70% se
+# va igual. El punto de equilibrio es p_churn = costo / (success_rate x LTV), unos
+# 0,12 para un LTV típico de ~$2.800. Una versión anterior contaba el churner
+# contactado como si se retuviera entero (sin cargar el LTV del 70% que igual se va),
+# lo que inflaba cada contacto a 1,3 x LTV y empujaba el umbral a 0,03.
 
 MLFLOW_EXPERIMENT_NAME = "customer_churn_retention"
 
@@ -63,7 +68,7 @@ def load_data(path: Path = DATA_PATH) -> pd.DataFrame:
     return df
 
 
-def split_data(df: pd.DataFrame, random_state: int = 42):
+def split_data(df: pd.DataFrame, random_state: int = 42, include_leaky: bool = False):
     """Split 50/30/20 estratificado por churn.
 
     train: ajusta el modelo. val: elige el umbral óptimo de retorno financiero — se
@@ -74,7 +79,10 @@ def split_data(df: pd.DataFrame, random_state: int = 42):
     el número que reportamos al final no está inflado por haber "espiado" los mismos
     datos dos veces.
     """
-    feature_columns = [c for c in df.columns if c not in (ID_COLUMN, TARGET_COLUMN, LTV_COLUMN)]
+    excluded = {ID_COLUMN, TARGET_COLUMN, LTV_COLUMN, *NON_FEATURE_COLUMNS}
+    if not include_leaky:
+        excluded |= set(LEAKY_COLUMNS)
+    feature_columns = [c for c in df.columns if c not in excluded]
 
     train_df, temp_df = train_test_split(
         df, test_size=0.5, stratify=df[TARGET_COLUMN], random_state=random_state
@@ -112,8 +120,9 @@ def compute_financial_value(
 ) -> float:
     """Valor financiero neto de aplicar la campaña de retención según `y_pred`.
 
-    - Verdadero positivo (se ataca a un churner real): se espera recuperar
-      `success_rate * ltv` de valor; el costo de campaña siempre se paga.
+    - Verdadero positivo (se ataca a un churner real): la oferta retiene a una
+      fracción `success_rate`; el resto se va igual, así que se pierde
+      `(1 - success_rate) * ltv` en esperanza. El costo de campaña siempre se paga.
     - Falso positivo (se ataca a alguien que no iba a fugarse): solo costo, sin
       beneficio (no había nada que retener).
     - Falso negativo (churner real no detectado): se pierde su LTV completo — el
@@ -129,7 +138,7 @@ def compute_financial_value(
     false_negative = (y_pred == 0) & (y_true == 1)
 
     value = 0.0
-    value += (success_rate * ltv[true_positive] - campaign_cost).sum()
+    value += (-(1 - success_rate) * ltv[true_positive] - campaign_cost).sum()
     value += (-campaign_cost * np.ones(int(false_positive.sum()))).sum()
     value += (-ltv[false_negative]).sum()
     return float(value)
@@ -305,7 +314,20 @@ def run_training(data_path: Path = DATA_PATH) -> dict:
         MODEL_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(model, MODEL_OUTPUT_PATH)
 
+        # Cuánto infla la filtración: mismo modelo y split, agregando num_complaints.
+        leaky_train, _, leaky_test, leaky_features = split_data(df, include_leaky=True)
+        leaky_model = train_model(leaky_train, leaky_features)
+        leaky_proba = leaky_model.predict_proba(leaky_test[leaky_features])[:, 1]
+        leaky_auc = float(roc_auc_score(leaky_test[TARGET_COLUMN], leaky_proba))
+        leaky_pr_auc = float(average_precision_score(leaky_test[TARGET_COLUMN], leaky_proba))
+        mlflow.log_metrics({"leaky_roc_auc": leaky_auc, "leaky_pr_auc": leaky_pr_auc})
+        print(f"Con la filtración (num_complaints): ROC-AUC {leaky_auc:.4f} | PR-AUC {leaky_pr_auc:.4f}")
+
         metadata = {
+            "data_source": "real" if df["geography"].isin(["France", "Germany", "Spain"]).all() and len(df) == 10_000 else "synthetic",
+            "churn_rate": float(df[TARGET_COLUMN].mean()),
+            "leaky_roc_auc_with_complaints": leaky_auc,
+            "leaky_pr_auc_with_complaints": leaky_pr_auc,
             "feature_columns": feature_columns,
             "categorical_features": CATEGORICAL_FEATURES,
             "optimal_threshold": best_threshold,

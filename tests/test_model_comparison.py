@@ -12,6 +12,7 @@ from __future__ import annotations
 import duckdb
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 from src.models import compare_models as cm
@@ -96,7 +97,7 @@ def test_run_comparison_end_to_end_smoke(tmp_path, monkeypatch):
     original_train_mlp = cm.train_mlp
 
     def fast_train_mlp(*args, **kwargs):
-        kwargs["epochs"] = 3
+        kwargs.update(max_epochs=3, min_epochs=1, checkpoint_dir=tmp_path / "ckpt")
         return original_train_mlp(*args, **kwargs)
 
     monkeypatch.setattr(cm, "train_mlp", fast_train_mlp)
@@ -125,3 +126,34 @@ def test_run_comparison_end_to_end_smoke(tmp_path, monkeypatch):
     con.close()
     assert n_models == 3
     assert n_activations == len(cm.ACTIVATIONS)
+
+
+def test_train_mlp_resumes_from_checkpoint_after_interruption(tmp_path, monkeypatch):
+    """Una corrida interrumpida retoma desde el último checkpoint y termina igual que una corrida limpia."""
+    import torch
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(200, 5)).astype(np.float32)
+    y = (X[:, 0] > 0).astype(np.float32)
+    Xv, yv = X[:60], y[:60]
+    kw = dict(activation="relu", max_epochs=6, min_epochs=6, patience=2)
+
+    _, clean = cm.train_mlp(X, y, Xv, yv, checkpoint_dir=tmp_path / "clean", **kw)
+
+    calls = {"n": 0}
+    original_step = torch.optim.Adam.step
+
+    def failing_step(self, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 3 * 1 + 1:  # 1 batch por época con batch_size 256: falla en la 4ta época
+            raise KeyboardInterrupt
+        return original_step(self, *a, **k)
+
+    monkeypatch.setattr(torch.optim.Adam, "step", failing_step)
+    with pytest.raises(KeyboardInterrupt):
+        cm.train_mlp(X, y, Xv, yv, checkpoint_dir=tmp_path / "resume", **kw)
+    monkeypatch.setattr(torch.optim.Adam, "step", original_step)
+
+    _, resumed = cm.train_mlp(X, y, Xv, yv, checkpoint_dir=tmp_path / "resume", **kw)
+    assert resumed["epochs_run"] == clean["epochs_run"] == 6
+    np.testing.assert_allclose(resumed["val_loss"], clean["val_loss"], rtol=1e-5)

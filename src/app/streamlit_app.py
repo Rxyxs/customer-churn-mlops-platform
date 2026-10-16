@@ -115,7 +115,7 @@ def render_individual_prediction() -> None:
         c1, c2, c3 = st.columns(3)
         with c1:
             credit_score = st.number_input("Credit score", 300, 850, 650)
-            geography = st.selectbox("Geografía", ["North", "South", "East", "West", "Central"])
+            geography = st.selectbox("País", ["France", "Germany", "Spain"])
             gender = st.selectbox("Género", ["Male", "Female"])
             age = st.number_input("Edad", 18, 100, 40)
         with c2:
@@ -126,7 +126,8 @@ def render_individual_prediction() -> None:
         with c3:
             has_credit_card = st.checkbox("Tiene tarjeta de crédito", value=True)
             is_active_member = st.checkbox("Miembro activo", value=True)
-            num_complaints = st.number_input("Quejas registradas", 0, 20, 0)
+            card_type = st.selectbox("Tipo de tarjeta", ["SILVER", "GOLD", "PLATINUM", "DIAMOND"])
+            points_earned = st.number_input("Puntos acumulados", 0, 1000, 600)
             satisfaction_score = st.slider("Satisfacción (1-5)", 1, 5, 3)
 
         monthly_fee_revenue = st.number_input("Ingreso mensual del cliente ($)", 0.0, 1000.0, 60.0, step=5.0)
@@ -141,7 +142,7 @@ def render_individual_prediction() -> None:
         "credit_score": credit_score, "geography": geography, "gender": gender, "age": age,
         "tenure_years": tenure_years, "balance": balance, "num_products": num_products,
         "has_credit_card": has_credit_card, "is_active_member": is_active_member,
-        "estimated_salary": estimated_salary, "num_complaints": num_complaints,
+        "estimated_salary": estimated_salary, "card_type": card_type, "points_earned": points_earned,
         "satisfaction_score": satisfaction_score, "monthly_fee_revenue": monthly_fee_revenue,
     }
     if ltv > 0:

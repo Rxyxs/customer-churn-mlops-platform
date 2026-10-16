@@ -17,23 +17,26 @@ An end-to-end customer churn prediction system for banking/retail, built around 
 
 ## Business Impact & Key Performance Indicators
 
-Evaluated on a test holdout never seen during training or threshold optimization:
+Trained on **10,000 real bank customers** (Kaggle "Bank Customer Churn", France / Germany / Spain, 20.4% churn) and evaluated on a 2,000-customer test holdout never seen during training or threshold selection. Value is measured against running no campaign at all (which loses $1.15M of churner LTV on the holdout):
 
-| Strategy | Net financial value | Customers contacted |
+| Strategy | LTV recovered, net of campaign cost | Customers contacted |
 |---|---:|---:|
-| Contact no one | −$809,055 | 0% |
-| Contact everyone (no model) | +$42,717 | 100% |
-| **Model's optimal threshold** | **+$75,847** | 78.6% |
+| Contact no one | $0 | 0% |
+| Contact everyone (no model) | +$143,842 | 100% |
+| **Model's threshold (0.24, chosen on validation)** | **+$189,930** | 41.7% |
 
-The model nearly doubles the return of an indiscriminate campaign, while contacting fewer people. That's the product: not "who is going to churn," but "who is it worth offering something to, and how much is it worth doing."
+The model recovers 32% more than an indiscriminate campaign while contacting fewer than half the customers. The offer cost ($100), retention rate (30%) and LTV are business assumptions, because the real dataset has churn but no revenue; they are documented in `src/data/make_dataset.py` and `src/models/train.py`.
 
-**The threshold isn't an artifact of a favorable split**: `notebooks/02_LTV_Cost_Sensitive_Thresholding.ipynb` verifies this directly — recalculated from scratch against the holdout's own real LTV distribution (a purely diagnostic exercise, never used as the operational decision), the optimum lands at exactly the same point (threshold = 0.03) as the one chosen on validation. See [Phase 4](#phase-4--ltv-weighted-threshold-analysis-on-holdout) for the full detail.
+Two findings from moving to real data:
+
+- **The `Complain` column is a leak.** 2,034 of the 2,038 churners have a complaint, against 10 of the 7,962 who stayed: the complaint is recorded together with the exit. With it, LightGBM scores ROC-AUC 1.000; without it, **0.852**. It is kept in the data and excluded from the features, and `train.py` logs both numbers on every run.
+- **The old financial objective double-counted.** It credited each contacted churner with 30% of their LTV but never charged the 70% who leave anyway, so each contact was worth 1.3 × LTV instead of 0.3 × LTV. That pushed the "optimal" threshold to 0.03 (contact 90% of customers). Fixed, the break-even is `p_churn = cost / (success_rate × LTV)`, about 0.12 for a typical customer, and the threshold lands at 0.24.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    A[make_dataset.py<br/>10,000 synthetic customers + LTV] --> B["train.py<br/>LightGBM + MLflow + threshold search"]
+    A[make_dataset.py<br/>10,000 real bank customers + assumed LTV] --> B["train.py<br/>LightGBM + MLflow + threshold search"]
     B --> C[(churn_model.joblib<br/>model_metadata.json)]
     C --> D["api/main.py<br/>FastAPI"]
     C --> E["app/streamlit_app.py<br/>ROI simulator"]
@@ -44,7 +47,7 @@ flowchart LR
 
 ```
 ┌────────────────────────┐
-│  make_dataset.py        │  10,000 synthetic customers + projected LTV
+│  make_dataset.py        │  10,000 real customers (Kaggle) + assumed LTV
 └────────────┬─────────────┘
              │
              ▼
@@ -78,11 +81,11 @@ This project was built in phases, delivered and verified one at a time — not w
 
 ### Phase 1 — Data and modeling
 
-`src/data/make_dataset.py` generates 10,000 synthetic bank customers with a logistic churn-risk model (tenure, satisfaction, complaints, activity, number of products) and a **projected LTV** (current monthly revenue × expected future months of useful life, by activity segment).
+`src/data/make_dataset.py` loads the real Kaggle dataset ([Bank Customer Churn](https://www.kaggle.com/datasets/radheshyamkollipara/bank-customer-churn), downloaded through the Kaggle API into the gitignored `data/raw/`) and maps it onto the project schema: credit score, country, gender, age, tenure, balance, products, card, activity, salary, satisfaction, card type, loyalty points, and the real exit flag. What the data does not have is revenue, so `monthly_fee_revenue` (15 + 8 × products + 0.0008 × balance) and the **projected LTV** (monthly revenue × expected future months, 48 if active and 18 if not) are explicit assumptions, used only for financial value and never as features. The original synthetic generator stays as a fallback with the same schema, for CI runs without Kaggle credentials.
 
-`src/models/train.py` trains LightGBM on a 50/30/20 split (train / val / test), tracks everything in MLflow (local SQLite, with a working Model Registry), and — the heart of the project — searches for the **decision threshold that maximizes net financial return** on validation, not the one that maximizes F1 or accuracy.
+`src/models/train.py` trains LightGBM on a stratified 50/30/20 split (train / val / test), tracks everything in MLflow (local SQLite, with a working Model Registry), and searches for the **decision threshold that maximizes net financial return** on validation, not the one that maximizes F1 or accuracy. The objective, per customer: an uncontacted churner loses their LTV; a contacted churner is retained with probability `success_rate`, otherwise lost; every contact costs the campaign price. Features exclude the customer ID, the LTV and revenue assumptions, and `num_complaints` (the leak above); the same run also trains a copy with the leak and logs its metrics, so the inflation stays visible.
 
-**This didn't work on the first try.** The first version of the optimal threshold was degenerate: 0.01, basically "contact everyone." The reason, once diagnosed: given this problem's cost asymmetry (not contacting a real churner costs their entire LTV; contacting someone who wasn't going to churn only costs the campaign price), the mathematical indifference point is `cost / (LTV × (1 + success_rate))` — and with a trivial campaign cost relative to the LTV at stake, that point falls below almost any predicted probability, so "contact everyone" wins mathematically without the model contributing anything. Adjusting the cost alone wasn't enough either: pushing it too high made the value negative at *every* threshold. The fix was two combined changes: a realistic campaign cost ($100, a real offer — fee discount, bonus — not a trivial phone call) and a less noisy risk model (ROC-AUC 0.75 → 0.82), until the optimum landed in a genuinely interior, profitable region. The full detail is commented in `src/models/train.py`.
+Test metrics: ROC-AUC 0.852, PR-AUC 0.687. Threshold 0.24 on validation; recomputed on test (diagnostic only) it would be 0.19, and the curve is flat enough there that the difference costs $6,300 (0.7%).
 
 ### Phase 2 — API and UI
 
@@ -94,7 +97,7 @@ This project was built in phases, delivered and verified one at a time — not w
 
 Multi-stage `Dockerfile`: `builder` (compiles with `build-essential`/`cmake`) → `runtime` (minimal shared base, with `libgomp1` installed — without that library, LightGBM fails to import on Debian slim with `libgomp.so.1: cannot open shared object file`, a real gotcha worth documenting) → `api` and `app` as final targets of the same Dockerfile, so the dependency definition isn't duplicated. `docker-compose.yml` brings up both services, mounts `data/` as a read-only volume (model artifacts aren't baked into the image), and uses a `curl`-free healthcheck (via the stdlib's `urllib`) so `app` waits for `api` to actually be ready.
 
-`tests/`: `pytest` integration suite. `conftest.py` auto-generates the dataset and trains the model if they don't exist — verified for real by deleting every artifact and running `pytest tests/` from scratch (16/16 green), not just assumed.
+`tests/`: `pytest` integration suite. `conftest.py` auto-generates the dataset and trains the model if they don't exist — verified for real by deleting every artifact and running `pytest tests/` from scratch (27/27 green), not just assumed. Without `data/raw/customers.csv` it tries the Kaggle API and falls back to the synthetic generator if there are no credentials.
 
 **Verifying Docker without an available daemon.** This execution environment doesn't have Docker installed (neither Docker Desktop nor the CLI), so `docker compose up --build` itself couldn't literally be run. Rather than leaving it at "review it before a real deployment" and moving on, everything that *can* be validated without the daemon was validated, by replicating every Dockerfile stage outside the container:
 
@@ -102,7 +105,7 @@ Multi-stage `Dockerfile`: `builder` (compiles with `build-essential`/`cmake`) �
 2. **The exact `CMD` commands from the Dockerfile, run as-is** — `uvicorn src.api.main:app --host 0.0.0.0 --port 8000` and `streamlit run src/app/streamlit_app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true` both start and serve correctly in that isolated venv.
 3. **The exact `healthcheck` command** from `docker-compose.yml` (`python -c "import urllib.request; urllib.request.urlopen(...)"`) run against the live API — responds `{"status":"ok","model_loaded":true}`.
 4. **The full end-to-end pipeline** (`make_dataset.py` → `train.py` → serving with the real `CMD`) run in the isolated venv, with no artifacts inherited from another install.
-5. **All 16 integration tests**, run from scratch against the freshly trained model.
+5. **All the integration tests**, run from scratch against the freshly trained model.
 
 This doesn't replace an actual `docker compose up --build` — the `COPY` paths, the multi-stage ordering, and the Docker engine itself still haven't literally run — but it covers exactly the code and commands that end up running inside the container, with far more confidence than "it's written carefully." **Recommendation**: before a real deployment, run `docker compose up --build` once on a machine with Docker installed as a final verification step.
 
@@ -110,9 +113,9 @@ This doesn't replace an actual `docker compose up --build` — the `COPY` paths,
 
 `notebooks/02_LTV_Cost_Sensitive_Thresholding.ipynb` (executed end to end, zero errors) digs into three questions `train.py` doesn't show in detail:
 
-1. **How is LTV distributed on the holdout?** The average real churner is worth $2,053, with a heavy tail (standard deviation ~$1,730, the same order of magnitude as the mean) — consistent with why the threshold is chosen on a sizeable (30%) validation set before ever touching the holdout.
-2. **Is the optimal threshold an artifact of the split, or does it generalize?** Recalculated directly against the holdout's own LTV distribution (purely diagnostic — the real operational decision remains the validation-derived one), the optimum lands at **exactly the same threshold (0.03)** chosen on validation, with a financial-value difference of $0.00. Direct evidence the threshold isn't overfit to one particular split.
-3. **Gains curve: retention cost vs. LTV saved.** Ranking the holdout from highest to lowest predicted risk, the model recovers substantially more LTV for the same campaign cost than random ordering does — the real lift, not just an abstract AUC. The exact optimum of the full financial objective (swept customer by customer, including the cost of failing to act on a real churner) lands within 12 customers of the operational threshold chosen by `train.py`'s 0.01-granularity grid search — that search's granularity isn't leaving meaningful value on the table.
+1. **How is LTV distributed on the holdout?** The average real churner is worth $2,809, with a heavy tail (standard deviation ~$2,030, the same order as the mean); $1.15M of LTV is at risk in the holdout.
+2. **Is the threshold an artifact of the split?** Validation picks 0.24; the optimum recomputed on the holdout (diagnostic only, never the operational decision) is 0.19. The value curve is flat near its peak, so the gap costs $6,300, 0.7% of the total.
+3. **Gains curve and deciles.** Ranked by predicted risk, the top decile has 81% real churn and the bottom one 2.5%. Only the first five deciles pay for the offer; from the sixth onward an offer costs more than it recovers. At the operational threshold the campaign contacts 834 customers (41.7%) and recovers $189,930 net; the exact per-customer optimum contacts 960 and recovers $7,000 more.
 
 ### Phase 5 — Model comparison: logistic regression vs. XGBoost vs. PyTorch MLP
 
@@ -126,27 +129,28 @@ Three complementary approaches:
 | Gradient-boosted trees | XGBoost | A second tree ensemble (different library than the one served in production) to check the result isn't an artifact of LightGBM specifically |
 | MLP with custom Focal Loss | PyTorch | Deep learning with a loss designed for the churn class imbalance (~20% positive), plus a controlled comparison of ReLU vs. GELU vs. Swish activations on the same architecture |
 
-**Test set results** (same holdout as Phases 1–4, evaluated at the default 0.5 threshold — this is a model-selection comparison, not the operational financial threshold from `train.py`):
+**Test set results** (same holdout as Phases 1–4, at the default 0.5 threshold; a model-selection comparison, not the operational financial threshold):
 
 | Model | ROC-AUC | PR-AUC | F1 |
 |---|---:|---:|---:|
-| Logistic regression | 0.852 | 0.601 | 0.568 |
-| XGBoost | 0.820 | 0.523 | 0.539 |
-| PyTorch MLP (best activation, Focal Loss) | 0.845 | 0.580 | 0.240 |
+| Logistic regression | 0.772 | 0.466 | 0.504 |
+| XGBoost | 0.845 | 0.675 | 0.600 |
+| PyTorch MLP (Swish, Focal Loss) | 0.855 | 0.687 | 0.462 |
+| LightGBM (served, from `train.py`) | 0.852 | 0.687 | — |
 
-The three families land in a similar ROC-AUC range on this synthetic dataset — no approach clearly dominates, which is itself useful evidence: it means LightGBM's edge in Phases 1–4 (ROC-AUC 0.82, tuned for the *financial* objective rather than F1) isn't being left on the table by a fundamentally better algorithm class. The MLP's F1 is lower at the untuned 0.5 threshold because Focal Loss reshapes the probability calibration around hard examples — consistent with `train.py`'s own finding that a naive 0.5 cutoff is the wrong lens for this problem in the first place.
+On real data the linear baseline falls clearly behind (ROC-AUC 0.77): the churn signal here is non-linear (age and number of products act in bands, not monotonically). The three non-linear models tie within 0.01 ROC-AUC, so LightGBM stays as the served model for its native categoricals and speed. The MLP's lower F1 at 0.5 comes from Focal Loss reshaping the probability scale, which is why the operational decision uses a financial threshold, not 0.5.
 
-**Activation comparison** (MLP, validation set, same architecture and Focal Loss, only the non-linearity changes):
+The MLP trains with early stopping on the validation loss (never test): at least 100 epochs, patience 20, ReduceLROnPlateau, and the best epoch's weights restored. A checkpoint is written every epoch (atomic write, with a fingerprint of data and configuration), and an interrupted run resumes from it; a test interrupts training mid-run and checks the resumed run matches a clean one. The best epochs were 30 (ReLU), 53 (GELU) and 61 (Swish) out of 100 run.
+
+**Activation comparison** (validation set, same architecture and Focal Loss):
 
 | Activation | ROC-AUC | PR-AUC | F1 |
 |---|---:|---:|---:|
-| ReLU | 0.849 | 0.591 | 0.251 |
-| GELU | 0.853 | 0.609 | 0.227 |
-| **Swish** | **0.855** | **0.619** | 0.206 |
+| ReLU | 0.848 | 0.679 | 0.423 |
+| GELU | 0.858 | 0.693 | 0.489 |
+| **Swish** | **0.861** | **0.696** | 0.471 |
 
-Swish had the best validation PR-AUC and was the activation selected for the test-set MLP row above.
-
-On this tabular, low-dimensional dataset the activation choice moves PR-AUC by a small margin — Swish edges out ReLU/GELU, but the gap doesn't come close to explaining the difference between model *families*. Measured, not assumed.
+Swish had the best validation PR-AUC and was selected for the test row. The spread between activations (0.017 PR-AUC) is smaller than the gap to the linear baseline.
 
 ![Model comparison](reports/figures/roc_pr_comparison.png)
 ![Confusion matrices](reports/figures/confusion_matrices.png)
@@ -172,7 +176,7 @@ customer-churn-mlops-platform/
 │                                    #   figures/threshold_vs_value.png (generated)
 ├── src/
 │   ├── data/
-│   │   └── make_dataset.py         # Generates 10,000 synthetic customers + LTV
+│   │   └── make_dataset.py         # Loads the real Kaggle data (+ synthetic fallback) + LTV
 │   ├── models/
 │   │   ├── train.py                # LightGBM + MLflow + financial-return threshold
 │   │   └── compare_models.py       # LR / XGBoost / PyTorch MLP comparison (Phase 5)
@@ -212,7 +216,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-# 1. Generate the synthetic dataset
+# 1. Build the dataset (downloads the real Kaggle data; needs ~/.kaggle/kaggle.json)
 python -m src.data.make_dataset
 
 # 2. Train (LightGBM + MLflow + financial threshold optimization)
@@ -282,13 +286,15 @@ Example:
 
 ```bash
 curl -X POST http://localhost:8000/predict -H "Content-Type: application/json" -d '{
-  "credit_score": 550, "geography": "West", "gender": "Male", "age": 35,
-  "tenure_years": 0, "balance": 500, "num_products": 1, "has_credit_card": false,
-  "is_active_member": false, "estimated_salary": 40000, "num_complaints": 5,
-  "satisfaction_score": 1, "monthly_fee_revenue": 25.0, "ltv": 450
+  "credit_score": 550, "geography": "Germany", "gender": "Female", "age": 52,
+  "tenure_years": 1, "balance": 110000, "num_products": 1, "has_credit_card": false,
+  "is_active_member": false, "estimated_salary": 40000, "satisfaction_score": 2,
+  "card_type": "SILVER", "points_earned": 400, "ltv": 2500
 }'
-# {"churn_probability":0.9741,"optimal_threshold":0.03,"recommended_action":"contact","expected_financial_value":31.51}
+# {"churn_probability":0.9742,"optimal_threshold":0.24,"recommended_action":"contact","expected_financial_value":630.66}
 ```
+
+`expected_financial_value` is the expected value of contacting this customer versus not contacting them: `p_churn × success_rate × LTV − cost`.
 
 ## Tech stack
 
@@ -308,9 +314,11 @@ curl -X POST http://localhost:8000/predict -H "Content-Type: application/json" -
 
 ## Known limitations
 
-- The data is synthetic (a custom generator, no connection to a real banking dataset) — the risk pattern and LTV are design assumptions, documented and calibrated, not observations.
+- The customers and the churn flag are real, but revenue and LTV are not: the dataset has no revenue column, so both are documented assumptions. The financial numbers show how the decision works under those assumptions, not the bank's actual returns.
+- The dataset is a single anonymous snapshot with no dates, so the split is stratified, not temporal; a production system would validate on later months.
+- `Complain` is excluded as a leak; satisfaction score and loyalty points could carry the same problem in a weaker form, since the dataset does not say when they were recorded.
 - The optimal threshold depends on `campaign_cost` and `retention_success_rate`, which are adjustable business assumptions (that's why the ROI simulator exists: to explore what happens if they change).
-- Threshold selection on a moderately sized validation set is sensitive to LTV's heavy tail — a handful of high-value customers can move the total by tens of thousands of dollars. §Phase 4 measures this sensitivity directly (comparing the validation threshold against the one recalculated on holdout) instead of just warning about it, and finds it stable on this dataset; a production system should keep monitoring this stability against real data.
+- Threshold selection on a moderately sized validation set is sensitive to LTV's heavy tail — a handful of high-value customers can move the total by tens of thousands of dollars. §Phase 4 measures this sensitivity directly (comparing the validation threshold against the one recalculated on holdout) instead of just warning about it, and finds a small, cheap gap (0.24 vs. 0.19, 0.7% of value); a production system should keep monitoring this stability against real data.
 - Docker verification in this environment was by equivalence (isolated venv + the Dockerfile's exact commands), not a literal `docker compose up --build` run — see §Phase 3 for the exact detail of what was validated and what still needs confirming on a machine with Docker.
 
 ## Author
