@@ -1,4 +1,4 @@
-[ 🇨🇱 Español ] | [ 🇺🇸 Read in English ](README.md)
+[[English](README.md) ] | [Español ]
 
 # Plataforma MLOps de Predicción y Retención de Churn de Clientes
 
