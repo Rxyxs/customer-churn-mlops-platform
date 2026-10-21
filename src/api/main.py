@@ -56,7 +56,7 @@ class CustomerFeatures(BaseModel):
     """Atributos de un cliente — mismas columnas que usó `src/models/train.py` para entrenar."""
 
     credit_score: int = Field(ge=300, le=850)
-    geography: Literal["North", "South", "East", "West", "Central"]
+    geography: Literal["France", "Germany", "Spain"]
     gender: Literal["Male", "Female"]
     age: int = Field(ge=18, le=100)
     tenure_years: int = Field(ge=0, le=50)
@@ -65,15 +65,19 @@ class CustomerFeatures(BaseModel):
     has_credit_card: bool
     is_active_member: bool
     estimated_salary: float = Field(ge=0)
-    num_complaints: int = Field(ge=0, le=20)
+    # No es feature del modelo (filtración del target en los datos reales); se acepta por compatibilidad.
+    num_complaints: int = Field(default=0, ge=0, le=20)
     satisfaction_score: int = Field(ge=1, le=5)
-    monthly_fee_revenue: float = Field(ge=0)
+    card_type: Literal["SILVER", "GOLD", "PLATINUM", "DIAMOND"]
+    points_earned: int = Field(ge=0, le=1000)
+    # Supuesto de ingreso; no es feature del modelo.
+    monthly_fee_revenue: float = Field(default=0.0, ge=0)
     ltv: Optional[float] = Field(
         default=None,
         ge=0,
         description=(
             "LTV proyectado del cliente. Si se envía, la respuesta agrega el valor "
-            "financiero esperado de la decisión de contactarlo o no."
+            "financiero esperado de contactarlo frente a no contactarlo."
         ),
     )
 
@@ -132,9 +136,9 @@ def _score_batch(customers: list[CustomerFeatures]) -> list[ChurnPrediction]:
 
         expected_value = None
         if customer.ltv is not None:
-            ev_contact = proba * success_rate * customer.ltv - cost
-            ev_no_contact = -proba * customer.ltv
-            expected_value = round(ev_contact if recommended_action == "contact" else ev_no_contact, 2)
+            # Valor esperado de contactar frente a no contactar: la oferta retiene a una
+            # fracción success_rate de los que se iban; el costo se paga siempre.
+            expected_value = round(proba * success_rate * customer.ltv - cost, 2)
 
         predictions.append(ChurnPrediction(
             churn_probability=round(proba, 4),

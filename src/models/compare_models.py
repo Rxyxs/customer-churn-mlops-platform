@@ -30,6 +30,7 @@ Salidas:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -56,12 +57,13 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
-from src.data.make_dataset import OUTPUT_PATH as RAW_DATA_PATH, generate_customers
-from src.models.train import DATA_PATH, ID_COLUMN, LTV_COLUMN, TARGET_COLUMN, load_data, split_data
+from src.data.make_dataset import OUTPUT_PATH as RAW_DATA_PATH, build_customers
+from src.models.train import CATEGORICAL_FEATURES, DATA_PATH, ID_COLUMN, LTV_COLUMN, TARGET_COLUMN, load_data, split_data
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FIGURES_DIR = PROJECT_ROOT / "reports" / "figures"
 DUCKDB_PATH = PROJECT_ROOT / "reports" / "model_comparison.duckdb"
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 
 RANDOM_STATE = 42
 ACTIVATIONS = ["relu", "gelu", "swish"]
@@ -134,9 +136,9 @@ def preprocess_features(
     """One-hot para categóricas + estandarización de numéricas, ajustado solo en
     train -- LR y el MLP necesitan features numéricas densas (a diferencia de
     LightGBM en `train.py`, que maneja categóricas nativamente)."""
-    train_enc = pd.get_dummies(train_df[feature_columns], columns=["geography", "gender"])
-    val_enc = pd.get_dummies(val_df[feature_columns], columns=["geography", "gender"])
-    test_enc = pd.get_dummies(test_df[feature_columns], columns=["geography", "gender"])
+    train_enc = pd.get_dummies(train_df[feature_columns], columns=CATEGORICAL_FEATURES)
+    val_enc = pd.get_dummies(val_df[feature_columns], columns=CATEGORICAL_FEATURES)
+    test_enc = pd.get_dummies(test_df[feature_columns], columns=CATEGORICAL_FEATURES)
 
     val_enc = val_enc.reindex(columns=train_enc.columns, fill_value=0)
     test_enc = test_enc.reindex(columns=train_enc.columns, fill_value=0)
@@ -170,20 +172,40 @@ def train_xgboost(X_train: np.ndarray, y_train: np.ndarray) -> XGBClassifier:
     return model
 
 
+def _fingerprint(*arrays: np.ndarray, **config) -> str:
+    """Huella de datos + configuración: un checkpoint de otros datos nunca se reutiliza."""
+    h = hashlib.sha256()
+    for arr in arrays:
+        h.update(np.ascontiguousarray(arr).tobytes())
+    h.update(json.dumps(config, sort_keys=True).encode())
+    return h.hexdigest()
+
+
 def train_mlp(
     X_train: np.ndarray,
     y_train: np.ndarray,
     X_val: np.ndarray,
     y_val: np.ndarray,
     activation: str,
-    epochs: int = 60,
+    max_epochs: int = 300,
+    min_epochs: int = 100,
+    patience: int = 20,
     lr: float = 1e-3,
     batch_size: int = 256,
     seed: int = RANDOM_STATE,
+    checkpoint_dir: Path | None = CHECKPOINT_DIR,
 ) -> tuple[ChurnMLP, dict]:
+    """Entrena con early stopping sobre la loss de validación (nunca test).
+
+    Corre al menos `min_epochs` épocas; después se detiene si la loss de validación no
+    mejora en `patience` épocas y restaura los pesos de la mejor época. Guarda un
+    checkpoint por época (escritura atómica) con la huella de datos y configuración;
+    si la corrida se interrumpe, la siguiente retoma desde el último checkpoint.
+    """
     torch.manual_seed(seed)
     model = ChurnMLP(n_features=X_train.shape[1], activation=activation)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=8)
     criterion = FocalLoss()
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
@@ -194,8 +216,31 @@ def train_mlp(
     n = X_train_t.shape[0]
     train_losses, val_losses = [], []
     generator = torch.Generator().manual_seed(seed)
+    best_val, best_epoch, best_state = float("inf"), -1, None
+    start_epoch = 0
 
-    for _epoch in range(epochs):
+    fingerprint = _fingerprint(
+        X_train, y_train, X_val, y_val, activation=activation, max_epochs=max_epochs,
+        min_epochs=min_epochs, patience=patience, lr=lr, batch_size=batch_size, seed=seed,
+    )
+    ckpt_path = None
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = checkpoint_dir / f"mlp_{activation}.pt"
+        if ckpt_path.exists():
+            ckpt = torch.load(ckpt_path, weights_only=False)
+            if ckpt.get("fingerprint") == fingerprint:
+                model.load_state_dict(ckpt["model"])
+                optimizer.load_state_dict(ckpt["optimizer"])
+                scheduler.load_state_dict(ckpt["scheduler"])
+                generator.set_state(ckpt["generator"])
+                train_losses, val_losses = ckpt["train_losses"], ckpt["val_losses"]
+                best_val, best_epoch, best_state = ckpt["best_val"], ckpt["best_epoch"], ckpt["best_state"]
+                start_epoch = len(val_losses)
+
+    for epoch in range(start_epoch, max_epochs):
+        if epoch >= min_epochs and epoch - best_epoch > patience:
+            break
         model.train()
         perm = torch.randperm(n, generator=generator)
         epoch_loss = 0.0
@@ -214,8 +259,28 @@ def train_mlp(
         with torch.no_grad():
             val_loss = criterion(model(X_val_t), y_val_t).item()
         val_losses.append(val_loss)
+        scheduler.step(val_loss)
+        if val_loss < best_val:
+            best_val, best_epoch = val_loss, epoch
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-    history = {"train_loss": train_losses, "val_loss": val_losses}
+        if ckpt_path is not None:
+            tmp = ckpt_path.with_suffix(".tmp")
+            torch.save({
+                "fingerprint": fingerprint, "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                "generator": generator.get_state(), "train_losses": train_losses,
+                "val_losses": val_losses, "best_val": best_val, "best_epoch": best_epoch,
+                "best_state": best_state,
+            }, tmp)
+            tmp.replace(ckpt_path)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    history = {
+        "train_loss": train_losses, "val_loss": val_losses,
+        "best_epoch": best_epoch + 1, "epochs_run": len(val_losses),
+    }
     return model, history
 
 
@@ -439,7 +504,7 @@ def persist_to_duckdb(
 def run_comparison(data_path: Path = DATA_PATH) -> dict:
     if not data_path.exists():
         RAW_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-        generate_customers().to_csv(RAW_DATA_PATH, index=False)
+        build_customers()[0].to_csv(RAW_DATA_PATH, index=False)
 
     df = load_data(data_path)
     train_df, val_df, test_df, feature_columns = split_data(df)
@@ -468,6 +533,7 @@ def run_comparison(data_path: Path = DATA_PATH) -> dict:
         val_proba = mlp_predict_proba(model, X_val)
         metrics = _binary_metrics(y_val, val_proba)
         histories[activation] = history
+        print(f"MLP {activation}: mejor época {history['best_epoch']} de {history['epochs_run']}")
         activation_metrics[activation] = metrics
         activation_rows.append({
             "run_timestamp": run_timestamp,

@@ -9,7 +9,7 @@ from src.api.main import app
 
 VALID_CUSTOMER = {
     "credit_score": 650,
-    "geography": "North",
+    "geography": "France",
     "gender": "Female",
     "age": 40,
     "tenure_years": 5,
@@ -20,23 +20,25 @@ VALID_CUSTOMER = {
     "estimated_salary": 60000.0,
     "num_complaints": 0,
     "satisfaction_score": 4,
+    "card_type": "GOLD",
+    "points_earned": 600,
     "monthly_fee_revenue": 60.0,
 }
 
 HIGH_RISK_CUSTOMER = {
     "credit_score": 500,
-    "geography": "West",
-    "gender": "Male",
-    "age": 30,
-    "tenure_years": 0,
-    "balance": 0.0,
-    "num_products": 1,
+    "geography": "Germany",
+    "gender": "Female",
+    "age": 55,
+    "tenure_years": 1,
+    "balance": 120000.0,
+    "num_products": 3,
     "has_credit_card": False,
     "is_active_member": False,
     "estimated_salary": 25000.0,
-    "num_complaints": 6,
     "satisfaction_score": 1,
-    "monthly_fee_revenue": 20.0,
+    "card_type": "SILVER",
+    "points_earned": 300,
 }
 
 

@@ -30,8 +30,18 @@ def test_compute_financial_value_perfect_classifier():
     ltv = np.array([1000.0, 2000.0, 500.0, 800.0])
 
     value = compute_financial_value(y_true, y_pred, ltv, campaign_cost=100, success_rate=0.3)
-    # TP: (0.3*1000-100) + (0.3*2000-100) = 200 + 500 = 700; sin FP ni FN.
-    assert value == pytest.approx(700.0)
+    # TP: el 70% de los churners contactados se va igual.
+    # -(0.7*1000) - 100 + -(0.7*2000) - 100 = -2300; sin FP ni FN.
+    assert value == pytest.approx(-2300.0)
+
+
+def test_contacting_a_churner_is_worth_success_rate_times_ltv_minus_cost():
+    # Contactar vs. no contactar al mismo churner difiere en success_rate * ltv - costo.
+    y_true = np.array([1])
+    ltv = np.array([1000.0])
+    contact = compute_financial_value(y_true, np.array([1]), ltv, campaign_cost=100, success_rate=0.3)
+    ignore = compute_financial_value(y_true, np.array([0]), ltv, campaign_cost=100, success_rate=0.3)
+    assert contact - ignore == pytest.approx(0.3 * 1000 - 100)
 
 
 def test_compute_financial_value_missed_churner_costs_full_ltv():
@@ -81,3 +91,34 @@ def test_load_data_and_split_data_are_stratified_and_disjoint():
     assert "ltv" not in feature_columns
     assert "churn" not in feature_columns
     assert "customer_id" not in feature_columns
+
+
+def test_real_to_schema_maps_kaggle_columns():
+    import pandas as pd
+
+    from src.data.make_dataset import real_to_schema
+
+    raw = pd.DataFrame({
+        "RowNumber": [1, 2], "CustomerId": [15634602, 15647311], "Surname": ["A", "B"],
+        "CreditScore": [619, 608], "Geography": ["France", "Spain"], "Gender": ["Female", "Female"],
+        "Age": [42, 41], "Tenure": [2, 1], "Balance": [0.0, 83807.86], "NumOfProducts": [1, 1],
+        "HasCrCard": [1, 0], "IsActiveMember": [1, 0], "EstimatedSalary": [101348.88, 112542.58],
+        "Exited": [1, 0], "Complain": [1, 0], "Satisfaction Score": [2, 3],
+        "Card Type": ["DIAMOND", "DIAMOND"], "Point Earned": [464, 456],
+    })
+    df = real_to_schema(raw)
+    assert list(df["churn"]) == [1, 0]
+    assert list(df["num_complaints"]) == [1, 0]
+    assert "Surname" not in df.columns
+    assert (df["ltv"] > 0).all()
+    # Mismo esquema que el generador sintético.
+    assert set(df.columns) == set(generate_customers(n_customers=10, seed=0).columns)
+
+
+def test_split_data_excludes_leaky_and_assumed_columns():
+    df = generate_customers(n_customers=500, seed=2)
+    _, _, _, features = split_data(df)
+    assert "num_complaints" not in features
+    assert "monthly_fee_revenue" not in features
+    _, _, _, leaky = split_data(df, include_leaky=True)
+    assert "num_complaints" in leaky

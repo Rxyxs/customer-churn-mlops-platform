@@ -18,9 +18,9 @@ MODEL_PATH = PROJECT_ROOT / "data" / "processed" / "churn_model.joblib"
 @pytest.fixture(scope="session", autouse=True)
 def ensure_trained_model() -> None:
     if not RAW_DATA_PATH.exists():
-        from src.data.make_dataset import OUTPUT_PATH, generate_customers
+        from src.data.make_dataset import OUTPUT_PATH, build_customers
 
-        df = generate_customers()
+        df, _ = build_customers()
         OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(OUTPUT_PATH, index=False)
 
